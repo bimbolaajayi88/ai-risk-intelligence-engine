@@ -12,38 +12,133 @@ st.title("🔍 AI Risk Intelligence Engine")
 st.write("**Pre-transaction anomaly detection for public finance and payment disbursement systems.**")
 
 st.info(
-    "This engine demonstrates the methodology applicable to public sector "
-    "payment and disbursement systems — including conditional cash transfer "
-    "programmes, government procurement systems, and fintech payment gateways. "
-    "It uses the Isolation Forest algorithm to detect behavioural anomalies "
-    "prior to transaction execution, shifting financial governance from "
-    "reactive audit to proactive risk mitigation."
+    "This engine demonstrates the methodology applicable to public sector payment and "
+    "disbursement systems — including conditional cash transfer programmes, government "
+    "procurement systems, and fintech payment gateways. It uses the Isolation Forest "
+    "algorithm to detect behavioural anomalies prior to transaction execution, shifting "
+    "financial governance from reactive audit to proactive risk mitigation."
 )
 
 st.write("---")
-st.write("Upload a structured transaction CSV file to generate fraud risk scores and anomaly flags.")
+st.write("Upload a structured transaction or beneficiary CSV file to generate risk scores and anomaly flags.")
+st.write("**Supported formats:** Standard transaction CSV (numeric) | SURE-P CCT Beneficiary Log")
 
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
+def detect_surep_format(df_raw):
+    """Detect if this is a SURE-P CCT beneficiary log."""
+    text = df_raw.to_string().upper()
+    return 'SURE-P' in text or 'ANC' in text or 'BENEFICIARY LOG' in text or 'CO-RESPONSIBILITY' in text
+
+def process_surep(df):
+    """Convert SURE-P CCT log into numeric risk features."""
+    df = df.copy()
+    df.columns = range(len(df.columns))
+
+    # Map columns based on known structure
+    col_names = {
+        0: 'SN', 2: 'DATE_REG', 3: 'CARD_NO', 4: 'SURNAME', 5: 'FIRST_NAME',
+        6: 'AGE', 7: 'VILLAGE', 8: 'PHONE', 9: 'PHONE_OWNER', 10: 'PAYMENT_METHOD',
+        12: 'ANC1', 13: 'DATE_ANC1', 14: 'ANC2', 15: 'DATE_ANC2',
+        16: 'ANC3', 17: 'DATE_ANC3', 18: 'ANC4', 19: 'DATE_ANC4',
+        20: 'SBD', 21: 'DATE_SBD', 22: 'PNC', 23: 'DATE_PNC',
+        24: 'IMM', 25: 'DATE_IMM', 28: 'NOTES'
+    }
+    df = df.rename(columns={k: v for k, v in col_names.items() if k in df.columns})
+
+    def yes_to_int(col):
+        if col in df.columns:
+            return df[col].astype(str).str.strip().str.upper().eq('YES').astype(int)
+        return pd.Series(0, index=df.index)
+
+    # Build numeric feature matrix
+    features = pd.DataFrame()
+    features['ANC1_Complete']     = yes_to_int('ANC1')
+    features['ANC2_Complete']     = yes_to_int('ANC2')
+    features['ANC3_Complete']     = yes_to_int('ANC3')
+    features['ANC4_Complete']     = yes_to_int('ANC4')
+    features['SBD_Complete']      = yes_to_int('SBD')
+    features['PNC_Complete']      = yes_to_int('PNC')
+    features['IMM_Complete']      = yes_to_int('IMM')
+    features['CoResp_Score']      = (
+        features['ANC1_Complete'] + features['ANC2_Complete'] +
+        features['ANC3_Complete'] + features['ANC4_Complete'] +
+        features['SBD_Complete']  + features['PNC_Complete']  +
+        features['IMM_Complete']
+    )
+    features['Has_Phone']         = df['PHONE'].astype(str).str.strip().ne('').ne('nan').astype(int) if 'PHONE' in df.columns else 0
+    features['Age']               = pd.to_numeric(df['AGE'], errors='coerce').fillna(features['Age'].mean() if 'Age' in features else 24) if 'AGE' in df.columns else 24
+
+    # Anomaly indicators
+    features['Missing_Phone_With_Attendance'] = (
+        (features['Has_Phone'] == 0) &
+        (features['ANC2_Complete'] == 1)
+    ).astype(int)
+
+    features['High_Attendance_No_Phone'] = (
+        (features['CoResp_Score'] >= 3) &
+        (features['Has_Phone'] == 0)
+    ).astype(int)
+
+    # Display dataframe
+    display_cols = {}
+    for c in ['SURNAME', 'FIRST_NAME', 'AGE', 'VILLAGE', 'PAYMENT_METHOD', 'NOTES']:
+        if c in df.columns:
+            display_cols[c] = df[c]
+    display_df = pd.DataFrame(display_cols)
+
+    return features, display_df
+
 if uploaded_file is not None:
-    data = pd.read_csv(uploaded_file)
 
-    # Separate labels if present
-    if "Class" in data.columns:
-        labels = data["Class"].values
-        features = data.drop(columns=["Class"])
+    # Try reading as standard CSV first
+    try:
+        raw = pd.read_csv(uploaded_file)
+        is_surep = detect_surep_format(raw)
+    except Exception:
+        uploaded_file.seek(0)
+        raw = pd.read_csv(uploaded_file, header=None)
+        is_surep = True
+
+    if is_surep:
+        # Re-read with SURE-P format
+        uploaded_file.seek(0)
+        raw_full = pd.read_csv(uploaded_file, header=None)
+        is_surep_confirm = detect_surep_format(raw_full)
+
+        if is_surep_confirm:
+            # Skip header rows and read data
+            uploaded_file.seek(0)
+            df_raw = pd.read_csv(uploaded_file, header=None, skiprows=7)
+            df_raw = df_raw[df_raw[0].astype(str).str.strip().str.isdigit()].reset_index(drop=True)
+
+            st.success("✅ SURE-P CCT Beneficiary Log detected — running CCT risk analysis")
+
+            features, display_df = process_surep(df_raw)
+            labels = None
+            data_type = 'surep'
+        else:
+            features = raw.select_dtypes(include=[np.number]).fillna(0)
+            labels = raw['Class'].values if 'Class' in raw.columns else None
+            if 'Class' in raw.columns:
+                features = raw.drop(columns=['Class'])
+            display_df = features.copy()
+            data_type = 'standard'
     else:
-        labels = None
-        features = data.copy()
+        if 'Class' in raw.columns:
+            labels = raw['Class'].values
+            features = raw.drop(columns=['Class'])
+        else:
+            labels = None
+            features = raw.copy()
+        features = features.select_dtypes(include=[np.number]).fillna(0)
+        display_df = features.copy()
+        data_type = 'standard'
 
-    # Keep only numeric columns
-    features = features.select_dtypes(include=[np.number]).fillna(0)
-
-    # Scale features
+    # Scale and run Isolation Forest
     scaler = StandardScaler()
     scaled = scaler.fit_transform(features)
 
-    # Train Isolation Forest
     iso = IsolationForest(contamination=0.05, random_state=42)
     iso.fit(scaled)
     anomaly_flag = iso.predict(scaled)
@@ -54,84 +149,75 @@ if uploaded_file is not None:
     ).round(2)
     anomaly_label = ["Anomaly" if x == -1 else "Normal" for x in anomaly_flag]
 
-    # Build results dataframe
-    results = features.copy()
+    # Build results
+    results = display_df.copy()
     results["Risk Score"] = risk_score
     results["Anomaly Flag"] = anomaly_label
     if labels is not None:
         results["Actual Class"] = labels
-    results = results.sort_values("Risk Score", ascending=False)
+    results = results.sort_values("Risk Score", ascending=False).reset_index(drop=True)
 
-    # ── METRICS ──
+    # SURE-P context note
+    if data_type == 'surep':
+        st.write("---")
+        st.write("### 📋 SURE-P CCT Analysis Context")
+        st.write(
+            "This analysis applies Isolation Forest anomaly detection to beneficiary "
+            "co-responsibility completion patterns. High risk scores indicate beneficiaries "
+            "whose attendance patterns deviate significantly from the programme baseline — "
+            "potential indicators of duplicate registration, payment irregularity, or data "
+            "entry anomalies requiring field verification."
+        )
+
+    # Metrics
     st.write("---")
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Records", f"{len(results):,}")
     col2.metric("Anomalies Detected", f"{(results['Anomaly Flag'] == 'Anomaly').sum():,}")
     col3.metric("Avg Risk Score", f"{results['Risk Score'].mean():.1f}")
 
-    # ── FILTER ──
+    # Filter
     st.subheader("Filter High-Risk Cases")
     threshold = st.slider("Show cases with Risk Score above:", 0, 100, 70)
     filtered = results[results["Risk Score"] >= threshold]
     st.write(f"**{len(filtered):,} records** above threshold")
     st.dataframe(filtered.head(50))
 
-    # ── RISK DISTRIBUTION ──
+    # Risk distribution
     st.subheader("Risk Score Distribution")
     st.bar_chart(results["Risk Score"].value_counts().sort_index())
 
-    # ── MODEL PERFORMANCE ──
+    # Model performance (only for labelled data)
     st.write("---")
     st.subheader("📊 Model Performance Analysis")
-    st.write(
-        "Where ground truth labels are available (column named 'Class'), "
-        "the engine evaluates model performance using standard classification metrics."
-    )
 
     if labels is not None:
-        # Convert Isolation Forest output to binary (1 = anomaly, 0 = normal)
         predicted = [1 if x == -1 else 0 for x in anomaly_flag]
-        actual = labels
-
-        # Classification report
-        report = classification_report(
-            actual, predicted,
-            target_names=["Normal", "Fraud"],
-            output_dict=True,
-            zero_division=0
-        )
+        report = classification_report(labels, predicted, target_names=["Normal","Fraud"], output_dict=True, zero_division=0)
         report_df = pd.DataFrame(report).transpose().round(3)
-
         st.write("#### Classification Report")
         st.dataframe(report_df)
 
-        # Key metrics
         precision = report["Fraud"]["precision"]
         recall = report["Fraud"]["recall"]
         f1 = report["Fraud"]["f1-score"]
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Precision (Fraud)", f"{precision:.1%}",
-                    help="Of all cases flagged as fraud, how many were actually fraud")
-        col2.metric("Recall (Fraud)", f"{recall:.1%}",
-                    help="Of all actual fraud cases, how many did the model catch")
-        col3.metric("F1 Score (Fraud)", f"{f1:.1%}",
-                    help="Harmonic mean of precision and recall")
+        col1.metric("Precision (Fraud)", f"{precision:.1%}", help="Of all flagged cases, how many were actual fraud")
+        col2.metric("Recall (Fraud)", f"{recall:.1%}", help="Of all actual fraud cases, how many were detected")
+        col3.metric("F1 Score (Fraud)", f"{f1:.1%}", help="Harmonic mean of precision and recall")
 
         st.write("#### Confusion Matrix")
-        cm = confusion_matrix(actual, predicted)
+        cm = confusion_matrix(labels, predicted)
         fig, ax = plt.subplots(figsize=(5, 3))
-        im = ax.imshow(cm, cmap="Blues")
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(["Predicted Normal", "Predicted Fraud"])
-        ax.set_yticklabels(["Actual Normal", "Actual Fraud"])
+        ax.imshow(cm, cmap="Blues")
+        ax.set_xticks([0,1]); ax.set_yticks([0,1])
+        ax.set_xticklabels(["Predicted Normal","Predicted Fraud"])
+        ax.set_yticklabels(["Actual Normal","Actual Fraud"])
         for i in range(2):
             for j in range(2):
-                ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                        color="black", fontsize=12)
-        plt.title("Confusion Matrix")
-        plt.tight_layout()
+                ax.text(j, i, str(cm[i,j]), ha="center", va="center", color="black", fontsize=12)
+        plt.title("Confusion Matrix"); plt.tight_layout()
         st.pyplot(fig)
 
         st.write("#### Interpretation")
@@ -142,15 +228,13 @@ if uploaded_file is not None:
             f"one for review. Precision of **{precision:.1%}** means that of every 100 "
             f"cases flagged, approximately {int(precision*100)} are genuine anomalies."
         )
-
     else:
         st.info(
-            "No ground truth labels detected in this dataset. "
-            "To enable model performance analysis, include a column named 'Class' "
-            "where 1 = fraudulent transaction and 0 = normal transaction."
+            "No ground truth labels detected. To enable model performance metrics, "
+            "include a column named 'Class' where 1 = fraud/anomaly and 0 = normal."
         )
 
-    # ── DOWNLOAD ──
+    # Download
     st.write("---")
     csv_output = filtered.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -164,7 +248,7 @@ else:
     st.write("---")
     st.write("### How it works")
     col1, col2, col3 = st.columns(3)
-    col1.write("**1. Upload**\nUpload any structured transaction CSV file")
+    col1.write("**1. Upload**\nUpload any transaction or beneficiary CSV file")
     col2.write("**2. Analyse**\nIsolation Forest detects anomalies in real time")
     col3.write("**3. Export**\nDownload flagged high-risk cases for investigation")
 
