@@ -5,6 +5,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
+import io
 
 st.set_page_config(page_title="AI Risk Intelligence Engine", layout="wide")
 
@@ -21,127 +22,94 @@ st.info(
 
 st.write("---")
 st.write("Upload a structured transaction or beneficiary CSV file to generate risk scores and anomaly flags.")
-st.write("**Supported formats:** Standard transaction CSV (numeric) | SURE-P CCT Beneficiary Log")
+st.write("**Supported formats:** Standard transaction CSV | SURE-P CCT Beneficiary Log")
 
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-def detect_surep_format(df_raw):
-    """Detect if this is a SURE-P CCT beneficiary log."""
-    text = df_raw.to_string().upper()
-    return 'SURE-P' in text or 'ANC' in text or 'BENEFICIARY LOG' in text or 'CO-RESPONSIBILITY' in text
+def is_surep(content_bytes):
+    """Check if file is SURE-P CCT format by scanning raw text."""
+    try:
+        text = content_bytes.decode('utf-8', errors='replace').upper()
+    except Exception:
+        return False
+    return any(k in text for k in ['SURE-P', 'BENEFICIARY LOG', 'CO-RESPONSIBILITY', 'ANC 1', 'REG. CARD'])
 
-def process_surep(df):
-    """Convert SURE-P CCT log into numeric risk features."""
-    df = df.copy()
-    df.columns = range(len(df.columns))
+def process_surep(content_bytes):
+    """Parse SURE-P CCT log and return feature matrix + display df."""
+    df_raw = pd.read_csv(io.BytesIO(content_bytes), header=None, skiprows=7, on_bad_lines='skip')
+    # Keep only rows where first column is a number (actual data rows)
+    df_raw = df_raw[df_raw[0].astype(str).str.strip().str.isdigit()].reset_index(drop=True)
 
-    # Map columns based on known structure
-    col_names = {
-        0: 'SN', 2: 'DATE_REG', 3: 'CARD_NO', 4: 'SURNAME', 5: 'FIRST_NAME',
-        6: 'AGE', 7: 'VILLAGE', 8: 'PHONE', 9: 'PHONE_OWNER', 10: 'PAYMENT_METHOD',
-        12: 'ANC1', 13: 'DATE_ANC1', 14: 'ANC2', 15: 'DATE_ANC2',
-        16: 'ANC3', 17: 'DATE_ANC3', 18: 'ANC4', 19: 'DATE_ANC4',
-        20: 'SBD', 21: 'DATE_SBD', 22: 'PNC', 23: 'DATE_PNC',
-        24: 'IMM', 25: 'DATE_IMM', 28: 'NOTES'
-    }
-    df = df.rename(columns={k: v for k, v in col_names.items() if k in df.columns})
+    def yes_col(col_idx):
+        if col_idx in df_raw.columns:
+            return df_raw[col_idx].astype(str).str.strip().str.upper().eq('YES').astype(int)
+        return pd.Series(0, index=df_raw.index)
 
-    def yes_to_int(col):
-        if col in df.columns:
-            return df[col].astype(str).str.strip().str.upper().eq('YES').astype(int)
-        return pd.Series(0, index=df.index)
-
-    # Build numeric feature matrix
     features = pd.DataFrame()
-    features['ANC1_Complete']     = yes_to_int('ANC1')
-    features['ANC2_Complete']     = yes_to_int('ANC2')
-    features['ANC3_Complete']     = yes_to_int('ANC3')
-    features['ANC4_Complete']     = yes_to_int('ANC4')
-    features['SBD_Complete']      = yes_to_int('SBD')
-    features['PNC_Complete']      = yes_to_int('PNC')
-    features['IMM_Complete']      = yes_to_int('IMM')
-    features['CoResp_Score']      = (
-        features['ANC1_Complete'] + features['ANC2_Complete'] +
-        features['ANC3_Complete'] + features['ANC4_Complete'] +
-        features['SBD_Complete']  + features['PNC_Complete']  +
-        features['IMM_Complete']
-    )
-    features['Has_Phone']         = df['PHONE'].astype(str).str.strip().ne('').ne('nan').astype(int) if 'PHONE' in df.columns else 0
-    features['Age']               = pd.to_numeric(df['AGE'], errors='coerce').fillna(features['Age'].mean() if 'Age' in features else 24) if 'AGE' in df.columns else 24
+    features['ANC1']         = yes_col(12)
+    features['ANC2']         = yes_col(14)
+    features['ANC3']         = yes_col(16)
+    features['ANC4']         = yes_col(18)
+    features['SBD']          = yes_col(20)
+    features['PNC']          = yes_col(22)
+    features['IMM']          = yes_col(24)
+    features['CoResp_Total'] = features[['ANC1','ANC2','ANC3','ANC4','SBD','PNC','IMM']].sum(axis=1)
+    features['Has_Phone']    = df_raw[8].astype(str).str.strip().ne('').ne('nan').astype(int) if 8 in df_raw.columns else 0
+    features['Age']          = pd.to_numeric(df_raw[6], errors='coerce').fillna(24) if 6 in df_raw.columns else 24
+    features['No_Phone_With_Attendance'] = ((features['Has_Phone']==0) & (features['ANC2']==1)).astype(int)
 
-    # Anomaly indicators
-    features['Missing_Phone_With_Attendance'] = (
-        (features['Has_Phone'] == 0) &
-        (features['ANC2_Complete'] == 1)
-    ).astype(int)
+    # Build display dataframe
+    display = pd.DataFrame()
+    if 4 in df_raw.columns: display['Surname']  = df_raw[4]
+    if 5 in df_raw.columns: display['First Name'] = df_raw[5]
+    if 6 in df_raw.columns: display['Age']      = df_raw[6]
+    if 7 in df_raw.columns: display['Village']  = df_raw[7]
+    if 3 in df_raw.columns: display['Card No']  = df_raw[3]
+    if 28 in df_raw.columns: display['Notes']   = df_raw[28]
+    display['CoResp Score'] = features['CoResp_Total']
 
-    features['High_Attendance_No_Phone'] = (
-        (features['CoResp_Score'] >= 3) &
-        (features['Has_Phone'] == 0)
-    ).astype(int)
+    return features, display
 
-    # Display dataframe
-    display_cols = {}
-    for c in ['SURNAME', 'FIRST_NAME', 'AGE', 'VILLAGE', 'PAYMENT_METHOD', 'NOTES']:
-        if c in df.columns:
-            display_cols[c] = df[c]
-    display_df = pd.DataFrame(display_cols)
-
-    return features, display_df
+def process_standard(content_bytes):
+    """Parse standard numeric CSV."""
+    df = pd.read_csv(io.BytesIO(content_bytes))
+    if 'Class' in df.columns:
+        labels = df['Class'].values
+        features = df.drop(columns=['Class'])
+    else:
+        labels = None
+        features = df.copy()
+    features = features.select_dtypes(include=[np.number]).fillna(0)
+    return features, features.copy(), labels
 
 if uploaded_file is not None:
 
-    # Try reading as standard CSV first
-    try:
-        raw = pd.read_csv(uploaded_file)
-        is_surep = detect_surep_format(raw)
-    except Exception:
-        uploaded_file.seek(0)
-        raw = pd.read_csv(uploaded_file, header=None)
-        is_surep = True
+    # Read all bytes once
+    content_bytes = uploaded_file.read()
 
-    if is_surep:
-        # Re-read with SURE-P format
-        uploaded_file.seek(0)
-        raw_full = pd.read_csv(uploaded_file, header=None)
-        is_surep_confirm = detect_surep_format(raw_full)
+    surep_format = is_surep(content_bytes)
 
-        if is_surep_confirm:
-            # Skip header rows and read data
-            uploaded_file.seek(0)
-            df_raw = pd.read_csv(uploaded_file, header=None, skiprows=7)
-            df_raw = df_raw[df_raw[0].astype(str).str.strip().str.isdigit()].reset_index(drop=True)
-
-            st.success("✅ SURE-P CCT Beneficiary Log detected — running CCT risk analysis")
-
-            features, display_df = process_surep(df_raw)
-            labels = None
-            data_type = 'surep'
-        else:
-            features = raw.select_dtypes(include=[np.number]).fillna(0)
-            labels = raw['Class'].values if 'Class' in raw.columns else None
-            if 'Class' in raw.columns:
-                features = raw.drop(columns=['Class'])
-            display_df = features.copy()
-            data_type = 'standard'
+    if surep_format:
+        features, display_df = process_surep(content_bytes)
+        labels = None
+        data_type = 'surep'
+        st.success("✅ SURE-P CCT Beneficiary Log detected — running CCT risk analysis")
     else:
-        if 'Class' in raw.columns:
-            labels = raw['Class'].values
-            features = raw.drop(columns=['Class'])
-        else:
-            labels = None
-            features = raw.copy()
-        features = features.select_dtypes(include=[np.number]).fillna(0)
-        display_df = features.copy()
+        features, display_df, labels = process_standard(content_bytes)
         data_type = 'standard'
 
-    # Scale and run Isolation Forest
+    if features.empty or len(features) == 0:
+        st.error("Could not extract data from this file. Please check the format and try again.")
+        st.stop()
+
+    # Scale
     scaler = StandardScaler()
     scaled = scaler.fit_transform(features)
 
+    # Isolation Forest
     iso = IsolationForest(contamination=0.05, random_state=42)
     iso.fit(scaled)
-    anomaly_flag = iso.predict(scaled)
+    anomaly_flag   = iso.predict(scaled)
     anomaly_scores = iso.decision_function(scaled)
     risk_score = (
         (1 - (anomaly_scores - anomaly_scores.min()) /
@@ -149,15 +117,15 @@ if uploaded_file is not None:
     ).round(2)
     anomaly_label = ["Anomaly" if x == -1 else "Normal" for x in anomaly_flag]
 
-    # Build results
+    # Results
     results = display_df.copy()
-    results["Risk Score"] = risk_score
+    results["Risk Score"]   = risk_score
     results["Anomaly Flag"] = anomaly_label
     if labels is not None:
         results["Actual Class"] = labels
     results = results.sort_values("Risk Score", ascending=False).reset_index(drop=True)
 
-    # SURE-P context note
+    # SURE-P context
     if data_type == 'surep':
         st.write("---")
         st.write("### 📋 SURE-P CCT Analysis Context")
@@ -172,43 +140,43 @@ if uploaded_file is not None:
     # Metrics
     st.write("---")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Records", f"{len(results):,}")
-    col2.metric("Anomalies Detected", f"{(results['Anomaly Flag'] == 'Anomaly').sum():,}")
-    col3.metric("Avg Risk Score", f"{results['Risk Score'].mean():.1f}")
+    col1.metric("Total Records",      f"{len(results):,}")
+    col2.metric("Anomalies Detected", f"{(results['Anomaly Flag']=='Anomaly').sum():,}")
+    col3.metric("Avg Risk Score",     f"{results['Risk Score'].mean():.1f}")
 
     # Filter
     st.subheader("Filter High-Risk Cases")
     threshold = st.slider("Show cases with Risk Score above:", 0, 100, 70)
-    filtered = results[results["Risk Score"] >= threshold]
+    filtered  = results[results["Risk Score"] >= threshold]
     st.write(f"**{len(filtered):,} records** above threshold")
     st.dataframe(filtered.head(50))
 
-    # Risk distribution
+    # Distribution
     st.subheader("Risk Score Distribution")
     st.bar_chart(results["Risk Score"].value_counts().sort_index())
 
-    # Model performance (only for labelled data)
+    # Model performance
     st.write("---")
     st.subheader("📊 Model Performance Analysis")
 
     if labels is not None:
         predicted = [1 if x == -1 else 0 for x in anomaly_flag]
-        report = classification_report(labels, predicted, target_names=["Normal","Fraud"], output_dict=True, zero_division=0)
+        report    = classification_report(labels, predicted, target_names=["Normal","Fraud"], output_dict=True, zero_division=0)
         report_df = pd.DataFrame(report).transpose().round(3)
         st.write("#### Classification Report")
         st.dataframe(report_df)
 
         precision = report["Fraud"]["precision"]
-        recall = report["Fraud"]["recall"]
-        f1 = report["Fraud"]["f1-score"]
+        recall    = report["Fraud"]["recall"]
+        f1        = report["Fraud"]["f1-score"]
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Precision (Fraud)", f"{precision:.1%}", help="Of all flagged cases, how many were actual fraud")
-        col2.metric("Recall (Fraud)", f"{recall:.1%}", help="Of all actual fraud cases, how many were detected")
-        col3.metric("F1 Score (Fraud)", f"{f1:.1%}", help="Harmonic mean of precision and recall")
+        col2.metric("Recall (Fraud)",    f"{recall:.1%}",    help="Of all actual fraud cases, how many were detected")
+        col3.metric("F1 Score (Fraud)",  f"{f1:.1%}",        help="Harmonic mean of precision and recall")
 
         st.write("#### Confusion Matrix")
-        cm = confusion_matrix(labels, predicted)
+        cm  = confusion_matrix(labels, predicted)
         fig, ax = plt.subplots(figsize=(5, 3))
         ax.imshow(cm, cmap="Blues")
         ax.set_xticks([0,1]); ax.set_yticks([0,1])
@@ -236,10 +204,10 @@ if uploaded_file is not None:
 
     # Download
     st.write("---")
-    csv_output = filtered.to_csv(index=False).encode("utf-8")
+    csv_out = filtered.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download High-Risk Cases as CSV",
-        data=csv_output,
+        data=csv_out,
         file_name="high_risk_cases.csv",
         mime="text/csv"
     )
