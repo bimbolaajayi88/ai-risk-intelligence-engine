@@ -35,7 +35,7 @@ def is_surep(content_bytes):
     return any(k in text for k in ['SURE-P', 'BENEFICIARY LOG', 'CO-RESPONSIBILITY', 'ANC 1', 'REG. CARD'])
 
 def process_surep(content_bytes):
-    """Parse SURE-P CCT log and return feature matrix + display df."""
+    """Parse SURE-P CCT log and return feature matrix + display df + labels if present."""
     df_raw = pd.read_csv(io.BytesIO(content_bytes), header=None, skiprows=7, on_bad_lines='skip')
     # Keep only rows where first column is a number (actual data rows)
     df_raw = df_raw[df_raw[0].astype(str).str.strip().str.isdigit()].reset_index(drop=True)
@@ -60,15 +60,23 @@ def process_surep(content_bytes):
 
     # Build display dataframe
     display = pd.DataFrame()
-    if 4 in df_raw.columns: display['Surname']  = df_raw[4]
+    if 4 in df_raw.columns: display['Surname']    = df_raw[4]
     if 5 in df_raw.columns: display['First Name'] = df_raw[5]
-    if 6 in df_raw.columns: display['Age']      = df_raw[6]
-    if 7 in df_raw.columns: display['Village']  = df_raw[7]
-    if 3 in df_raw.columns: display['Card No']  = df_raw[3]
-    if 28 in df_raw.columns: display['Notes']   = df_raw[28]
+    if 6 in df_raw.columns: display['Age']        = df_raw[6]
+    if 7 in df_raw.columns: display['Village']    = df_raw[7]
+    if 3 in df_raw.columns: display['Card No']    = df_raw[3]
+    if 28 in df_raw.columns: display['Notes']     = df_raw[28]
     display['CoResp Score'] = features['CoResp_Total']
 
-    return features, display
+    # --- FIX: Extract Class labels if present as last column ---
+    labels = None
+    last_col_idx = df_raw.shape[1] - 1
+    if last_col_idx > 28:  # Only check if there are more columns than the standard format
+        last_col = df_raw.iloc[:, last_col_idx].astype(str).str.strip()
+        if last_col.isin(['0', '1']).all():
+            labels = last_col.astype(int).values
+
+    return features, display, labels
 
 def process_standard(content_bytes):
     """Parse standard numeric CSV."""
@@ -90,8 +98,7 @@ if uploaded_file is not None:
     surep_format = is_surep(content_bytes)
 
     if surep_format:
-        features, display_df = process_surep(content_bytes)
-        labels = None
+        features, display_df, labels = process_surep(content_bytes)
         data_type = 'surep'
         st.success("✅ SURE-P CCT Beneficiary Log detected — running CCT risk analysis")
     else:
